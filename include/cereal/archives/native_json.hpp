@@ -32,8 +32,11 @@
 #include <cereal/archives/json.hpp>
 #include <cereal/types/base_class.hpp>
 
-#include <map>
 #include <type_traits>
+
+// Built-in support for optionality with std.optional.
+// Specialize NativeJSONOptional for other optional types.
+namespace std { template <typename T> class optional; }
 
 namespace cereal
 {
@@ -199,6 +202,11 @@ namespace cereal
         return itsNodeStack.top() == NodeType::InArray;
       }
 
+      bool isInObject()
+      {
+        return itsNodeStack.top() == NodeType::InObject;
+      }
+
       //! Sets the name for the next node created with startNode
       void setNextName( const char * name )
       {
@@ -325,6 +333,12 @@ namespace cereal
       {
         itsWriter.StartArray();
         itsNodeStack.top() = NodeType::InArray;
+      }
+
+      void startObject()
+      {
+        itsWriter.StartObject();
+        itsNodeStack.top() = NodeType::InObject;
       }
 
       JSONWriter& writer() { return itsWriter; }
@@ -614,6 +628,10 @@ namespace cereal
         if (!search())
           return false;
 
+        return startNodeWithConfirmedName();
+      }
+      bool startNodeWithConfirmedName()
+      {
         if(itsIteratorStack.back().value().IsArray())
           itsIteratorStack.emplace_back(itsIteratorStack.back().value().Begin(), itsIteratorStack.back().value().End());
         else if(itsIteratorStack.back().value().IsObject())
@@ -796,12 +814,31 @@ namespace cereal
 
       //! @}
 
+      size_t getArraySize() const
+      {
+         return itsIteratorStack.back().arraySize();
+      }
+
     private:
       const char * itsNextName;               //!< Next name set by NVP
       ReadStream itsReadStream;               //!< Rapidjson write stream
       std::vector<Iterator> itsIteratorStack; //!< 'Stack' of rapidJSON iterators
       rapidjson::Document itsDocument;        //!< Rapidjson document
       bool itsRootElementStarted;             //!< Whether processing of the root element has started
+  };
+
+  template <typename T>
+  struct NativeJSONOptional
+  {
+      static constexpr bool is_optional = false;
+  };
+
+  template <typename T>
+  struct NativeJSONOptional<std::optional<T>>
+  {
+      static bool has_value(std::optional<T> const& o) { return o.has_value(); }
+      static decltype(auto) value(std::optional<T> const& o) { return o.value(); }
+      static void value(std::optional<T>& o, T const& v) { o = v; }
   };
 
   namespace traits
@@ -842,6 +879,39 @@ namespace cereal
         static_assert(has_minimal_input_serialization<std::decay_t<T>, NativeJSONInputArchive>::value
            == has_minimal_output_serialization<std::decay_t<T>, NativeJSONOutputArchive>::value,
            "has_minimal_{in,out}put_serialization must agree");
+     };
+     template <typename T, typename = void>
+     struct is_optional
+     {
+        // Default to true to prevent clients needing to explicitly specify
+        // is_optional in their NativeJSONOptional specializations.  The fact
+        // that they have defined a specialization for NativeJSONOptional<T>
+        // should be enough to infer T as an optional.
+        // Why this works without false positives: This predicate will only
+        // ever be passed one argument.  The second will be derived from the
+        // specialization below.  The specialization will match the default
+        // NativeJSONOptional<T> defined above (which defines value to be
+        // false).  Any user-defined NativeJSONOptional will either define
+        // is_optional to be true or, more likely, not define it at all.
+        // In the latter case we hit this default specification.
+        static constexpr bool value = true;
+     };
+     template <typename T>
+     struct is_optional<T, std::void_t<decltype(NativeJSONOptional<std::decay_t<T>>::is_optional)>>
+     {
+        static constexpr bool value = NativeJSONOptional<std::decay_t<T>>::is_optional;
+     };
+     template <typename O> bool optional_has_value(O const& o) { return NativeJSONOptional<O>::has_value(o); }
+     template <typename O> auto optional_value(O const& o) { return NativeJSONOptional<O>::value(o); }
+     template <typename O, typename V> auto optional_value(O& o, V const& v) { return NativeJSONOptional<std::decay_t<O>>::value(o, v); }
+     template <typename O>
+     using optional_value_type = std::decay_t<decltype(traits::optional_value(std::declval<O>()))>;
+     template <typename T, typename = int>
+     struct is_scalar_or_minimal_optional { static constexpr bool value = false; };
+     template <typename T>
+     struct is_scalar_or_minimal_optional<T, std::enable_if_t<is_optional<T>::value>>
+     {
+        static constexpr bool value = is_scalar_or_minimal<optional_value_type<T>>::value;
      };
   };
 
@@ -897,13 +967,25 @@ namespace cereal
   // ######################################################################
   //! Epilogue for NVPs for JSON archives
   template <class T, traits::DisableIf<traits::is_scalar_or_minimal<T>::value> = traits::sfinae> inline
-  void epilogue( NativeJSONOutputArchive & ar, NameValuePair<T> const & )
-  { ar.finishNode(); }
+  void epilogue( NativeJSONOutputArchive & ar, NameValuePair<T> const & nvp )
+  {
+     // Optionals would be flattened if trivial or omitted completely if not present
+     if constexpr (traits::is_optional<T>::value)
+       if (traits::is_scalar_or_minimal<traits::optional_value_type<T>>::value || !traits::optional_has_value(nvp.value))
+         return;
+     ar.finishNode();
+  }
 
   //! Epilogue for NVPs for JSON archives
   template <class T, traits::DisableIf<traits::is_scalar_or_minimal<T>::value> = traits::sfinae> inline
-  void epilogue( NativeJSONInputArchive & ar, NameValuePair<T> const & )
-  { ar.finishNode(); }
+  void epilogue( NativeJSONInputArchive & ar, NameValuePair<T> const & nvp )
+  {
+     // Optionals would be flattened if trivial or omitted completely if not present
+     if constexpr (traits::is_optional<T>::value)
+       if (traits::is_scalar_or_minimal<traits::optional_value_type<T>>::value || !traits::optional_has_value(nvp.value))
+         return;
+     ar.finishNode();
+  }
 
   // ######################################################################
   //! Prologue for SizeTags for JSON archives
@@ -959,10 +1041,29 @@ namespace cereal
   template <class T> inline
   void CEREAL_SAVE_FUNCTION_NAME( NativeJSONOutputArchive & ar, NameValuePair<T> const & t )
   {
-    ar.setNextName( t.name );
-    if (!traits::is_scalar_or_minimal<T>::value)
-       ar.startNode();
-    ar( t.value );
+    // Only needed for the case of an object containing all optional fields where none are set.
+    // In this case, no serialization is ever done meaning no text ever gets rendered (i.e. we
+    // get "" instead of the desired "{}").
+    if (!ar.isInObject())
+      ar.startObject();
+
+    if constexpr (traits::is_optional<T>::value)
+    {
+      if (traits::optional_has_value(t.value))
+      {
+        ar.setNextName( t.name );
+        if (!traits::is_scalar_or_minimal<traits::optional_value_type<T>>::value)
+          ar.startNode();
+        ar( traits::optional_value(t.value) );
+      }
+    }
+    else
+    {
+      ar.setNextName( t.name );
+      if (!traits::is_scalar_or_minimal<T>::value)
+        ar.startNode();
+      ar( t.value );
+    }
   }
 
   template <class T> inline
@@ -971,14 +1072,35 @@ namespace cereal
     ar.setNextName( t.name );
     // Only continue to load the value if the name is found and, if necessary,
     // a new node (array or object) is started.
-    if (traits::is_scalar_or_minimal<T>::value)
+    if constexpr (traits::is_scalar_or_minimal<T>::value || traits::is_optional<T>::value)
     {
        if (!ar.search())
+       {
+          // XXX: If we wanted to preserve user values here (a mode maybe) rather than
+          // XXX: overwrite with "unset", we would also need to startNodeWithConfirmedName()
+          // XXX: (even though there isn't a confirmed name) to balance with the finishNode above
+          // XXX: which happens if an optional ended up having a value (it is assumed that the
+          // XXX: value was read from the input).
+          if constexpr (traits::is_optional<T>::value)
+             t.value = {};
           return;
+       }
     }
     else if (!ar.startNode())
        return;
-    ar( t.value );
+
+    if constexpr (traits::is_optional<T>::value)
+    {
+       if constexpr (!traits::is_scalar_or_minimal<traits::optional_value_type<T>>::value)
+          if (!ar.startNodeWithConfirmedName())
+             return;
+
+       traits::optional_value_type<T> r;
+       ar(r);
+       traits::optional_value(t.value, r);
+    }
+    else
+       ar( t.value );
   }
 
   //! Saving for non-enum scalars to JSON
@@ -1016,6 +1138,30 @@ namespace cereal
   template <typename T> inline decltype(auto) json_key_from( T&& key ) { return key; }
   template <> inline int json_key_to<int>( const char* key ) { return atoi(key); }
   inline std::string json_key_from( int key ) { return std::to_string(key); }
+
+  // Standalone optionals are modeled as a JSON array with at most one element,
+  // the optional value.
+  template <typename O>
+  inline std::enable_if_t<traits::is_optional<O>::value> save( NativeJSONOutputArchive& ar, O const& o )
+  {
+     ar.startArray();
+     if (traits::optional_has_value(o))
+        ar & traits::optional_value(o);
+  }
+  template <typename O>
+  inline std::enable_if_t<traits::is_optional<O>::value> load( NativeJSONInputArchive& ar, O& o )
+  {
+     if (ar.getArraySize() == 0)
+     {
+       // XXX: Possible mode to preserve user fields when optionals are not
+       // XXX: present in the input.  See also the NameValuePair input above.
+        o = {};
+        return;
+     }
+     traits::optional_value_type<O> r;
+     ar(r);
+     traits::optional_value(o, r);
+  }
 
   //! Saving for standard-like associative types with scalar keys
   template <template <typename...> class Map, typename... Args, typename = typename Map<Args...>::mapped_type>
