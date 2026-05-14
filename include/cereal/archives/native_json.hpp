@@ -36,7 +36,9 @@
 
 // Built-in support for optionality with std.optional.
 // Specialize NativeJSONOptional for other optional types.
-namespace std { template <typename T> class optional; }
+#if defined(__has_include) && __has_include(<optional>)
+#include <optional>
+#endif
 
 namespace cereal
 {
@@ -833,6 +835,7 @@ namespace cereal
       static constexpr bool is_optional = false;
   };
 
+  #if __cpp_lib_optional
   template <typename T>
   struct NativeJSONOptional<std::optional<T>>
   {
@@ -840,6 +843,7 @@ namespace cereal
       static decltype(auto) value(std::optional<T> const& o) { return o.value(); }
       static void value(std::optional<T>& o, T const& v) { o = v; }
   };
+  #endif
 
   namespace traits
   {
